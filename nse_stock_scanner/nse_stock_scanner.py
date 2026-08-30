@@ -1,4 +1,3 @@
-Link Sync 🔗:
 import reflex as rx
 import pandas as pd
 import yfinance as yf
