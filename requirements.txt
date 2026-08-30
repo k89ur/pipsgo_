@@ -1,0 +1,5 @@
+reflex
+pandas
+yfinance
+requests
+numpy
