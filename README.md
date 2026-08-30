@@ -4,7 +4,7 @@ This is the Reflex conversion of the original Streamlit NSE scanner.
 
 ## Files
 
-- `nse_stock_scanner/nse_stock_scanner.py` - Reflex application
+- `nse_scan/nse_scan.py` - Reflex application
 - `rxconfig.py` - Reflex configuration
 - `requirements.txt` - Python dependencies
 
