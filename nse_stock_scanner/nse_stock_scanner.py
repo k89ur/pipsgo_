@@ -1,160 +1,51 @@
-# ============================================================
-# NSE STOCK SCANNER
-# ============================================================
-#
-# CONDITIONS
-#
-# 1. NSE EQ stocks
-# 2. Minimum 365 trading days
-# 3. LTP > ₹100
-# 4. LTP within +/-15% of 50 DMA
-# 5. LTP maximum 5% below 52-week high
-#
-# FEATURES
-#
-# - One-click scan
-# - Mobile-friendly UI
-# - Progress indicator
-# - TradingView links
-# - CSV download
-# - Scan statistics
-# - Optimized batch downloading
-#
-# ============================================================
-
-import streamlit as st
+Link Sync 🔗:
+import reflex as rx
 import pandas as pd
 import yfinance as yf
 import requests
 import io
 import time
+import asyncio
+from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 
 
 # ============================================================
-# PAGE CONFIGURATION
-# ============================================================
-
-st.set_page_config(
-    page_title="NSE Stock Scanner",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
-
-
-# ============================================================
-# SCANNER SETTINGS
+# SETTINGS
 # ============================================================
 
 MIN_LTP = 100.0
-
 DMA50_DISTANCE = 15.0
-
 MAX_BELOW_52W_HIGH = 5.0
-
 MIN_TRADING_DAYS = 365
 
 BATCH_SIZE = 50
-
 BATCH_DELAY = 0.35
 
 
 # ============================================================
-# CUSTOM CSS
+# DATA MODEL
 # ============================================================
 
-st.markdown(
-    """
-    <style>
-
-    .main-title {
-        font-size: 32px;
-        font-weight: 700;
-        margin-bottom: 0px;
-    }
-
-    .subtitle {
-        color: #888888;
-        margin-top: 0px;
-        margin-bottom: 20px;
-    }
-
-    div.stButton > button {
-        width: 100%;
-        height: 55px;
-        font-size: 20px;
-        font-weight: 600;
-        border-radius: 10px;
-    }
-
-    .condition-box {
-        padding: 12px;
-        border-radius: 10px;
-        background-color: rgba(128,128,128,0.08);
-        margin-bottom: 8px;
-    }
-
-    </style>
-    """,
-    unsafe_allow_html=True
-)
+@dataclass
+class StockRow:
+    rank: int
+    symbol: str
+    ltp: str
+    dma50: str
+    from_dma50: str
+    high_52w: str
+    below_52w: str
+    trading_days: int
+    tradingview: str
 
 
 # ============================================================
-# HEADER
+# NSE SYMBOLS
 # ============================================================
 
-st.markdown(
-    '<div class="main-title">📈 NSE Stock Scanner</div>',
-    unsafe_allow_html=True
-)
-
-st.markdown(
-    '<div class="subtitle">'
-    '50-DMA + 52-Week High scanner'
-    '</div>',
-    unsafe_allow_html=True
-)
-
-
-# ============================================================
-# CONDITIONS DISPLAY
-# ============================================================
-
-with st.expander("📋 Scan Conditions", expanded=False):
-
-    st.markdown(
-        f"""
-        <div class="condition-box">
-        ✅ NSE Equity stocks
-        </div>
-
-        <div class="condition-box">
-        ✅ Minimum {MIN_TRADING_DAYS} trading days
-        </div>
-
-        <div class="condition-box">
-        ✅ LTP &gt; ₹{MIN_LTP:,.0f}
-        </div>
-
-        <div class="condition-box">
-        ✅ LTP within ±{DMA50_DISTANCE}% of 50-DMA
-        </div>
-
-        <div class="condition-box">
-        ✅ Maximum {MAX_BELOW_52W_HIGH}% below 52-week high
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-
-# ============================================================
-# NSE SYMBOL LIST
-# ============================================================
-
-@st.cache_data(ttl=86400, show_spinner=False)
+@lru_cache(maxsize=1)
 def get_nse_symbols():
 
     url = (
@@ -173,21 +64,21 @@ def get_nse_symbols():
             "text/html,application/xhtml+xml,"
             "application/xml;q=0.9,*/*;q=0.8"
         ),
-        "Referer": "https://www.nseindia.com/"
+        "Referer": "https://www.nseindia.com/",
     }
 
     session = requests.Session()
 
-    response = session.get(
+    session.get(
         "https://www.nseindia.com/",
         headers=headers,
-        timeout=20
+        timeout=20,
     )
 
     response = session.get(
         url,
         headers=headers,
-        timeout=30
+        timeout=30,
     )
 
     response.raise_for_status()
@@ -208,10 +99,9 @@ def get_nse_symbols():
             .astype(str)
             .str.strip()
             .eq("EQ")
-        ].copy()
+        ]
 
     if "SYMBOL" not in df.columns:
-
         raise ValueError(
             "NSE SYMBOL column not found."
         )
@@ -225,13 +115,11 @@ def get_nse_symbols():
         .tolist()
     )
 
-    symbols = sorted(symbols)
-
-    return symbols
+    return sorted(symbols)
 
 
 # ============================================================
-# DOWNLOAD ONE BATCH
+# DOWNLOAD BATCH
 # ============================================================
 
 def download_batch(batch):
@@ -243,101 +131,77 @@ def download_batch(batch):
 
     try:
 
-        data = yf.download(
+        return yf.download(
             tickers=tickers,
             period="2y",
             interval="1d",
             group_by="ticker",
             auto_adjust=False,
             progress=False,
-            threads=True
+            threads=True,
         )
 
-        return data
-
     except Exception:
-
         return None
 
 
 # ============================================================
-# PROCESS ONE STOCK
+# PROCESS STOCK
 # ============================================================
 
-def process_stock(
-    symbol,
-    data,
-    stats
-):
+def process_stock(symbol, data, stats):
 
     ticker = f"{symbol}.NS"
 
     try:
 
-        # ----------------------------------------------------
-        # Extract ticker data
-        # ----------------------------------------------------
-
-        if ticker in data.columns.get_level_values(0):
-
-            df = data[ticker].copy()
-
-        else:
-
+        if data is None or data.empty:
             return None
+
+        if not isinstance(
+            data.columns,
+            pd.MultiIndex
+        ):
+            return None
+
+        if ticker not in data.columns.get_level_values(0):
+            return None
+
+        df = data[ticker].copy()
 
         if df.empty:
-
             return None
 
-        # ----------------------------------------------------
-        # Clean data
-        # ----------------------------------------------------
-
-        required_columns = [
-            "Close",
-            "High"
-        ]
-
         df = df.dropna(
-            subset=required_columns
+            subset=["Close", "High"]
         )
 
         if df.empty:
-
             return None
 
         # ----------------------------------------------------
-        # CONDITION 1
-        # Minimum trading history
+        # HISTORY
         # ----------------------------------------------------
 
         trading_days = len(df)
 
         if trading_days < MIN_TRADING_DAYS:
-
             return None
 
         stats["365_days"] += 1
 
         # ----------------------------------------------------
-        # Current LTP
+        # LTP
         # ----------------------------------------------------
 
         ltp = float(
             df["Close"].iloc[-1]
         )
 
-        # ----------------------------------------------------
-        # CONDITION 2
-        # LTP > ₹100
-        # ----------------------------------------------------
-
         if ltp <= MIN_LTP:
-
             return None
 
-        stats["ltp"] += 1
+stats["ltp"] += 1
 
         # ----------------------------------------------------
         # 50 DMA
@@ -347,539 +211,750 @@ def process_stock(
             df["Close"]
             .rolling(
                 window=50,
-                min_periods=50
+                min_periods=50,
             )
             .mean()
             .iloc[-1]
         )
 
         if pd.isna(sma50):
-
             return None
 
         sma50 = float(sma50)
 
-        # ----------------------------------------------------
-        # Distance from 50 DMA
-        # ----------------------------------------------------
-
-        distance_from_50dma = (
+        distance = (
             (ltp - sma50)
             / sma50
         ) * 100
 
-        # ----------------------------------------------------
-        # CONDITION 3
-        # Within +/-15% of 50 DMA
-        # ----------------------------------------------------
-
-        if abs(distance_from_50dma) > DMA50_DISTANCE:
-
+        if abs(distance) > DMA50_DISTANCE:
             return None
 
         stats["dma50"] += 1
 
         # ----------------------------------------------------
         # 52 WEEK HIGH
-        #
-        # Last 252 trading sessions
         # ----------------------------------------------------
 
         last_252 = df.tail(252)
 
         if len(last_252) < 252:
-
             return None
 
         high_52w = float(
             last_252["High"].max()
         )
 
-        # ----------------------------------------------------
-        # % below 52 week high
-        # ----------------------------------------------------
-
-        below_52w_high = (
+        below_high = (
             (high_52w - ltp)
             / high_52w
         ) * 100
 
-        # Protect against tiny floating point negatives
-        below_52w_high = max(
+        below_high = max(
             0.0,
-            below_52w_high
+            below_high,
         )
 
-        # ----------------------------------------------------
-        # CONDITION 4
-        # Within 5% below 52W high
-        # ----------------------------------------------------
-
-        if below_52w_high > MAX_BELOW_52W_HIGH:
-
+        if below_high > MAX_BELOW_52W_HIGH:
             return None
 
         stats["52w"] += 1
 
         # ----------------------------------------------------
-        # TRADINGVIEW LINK
+        # TRADINGVIEW
         # ----------------------------------------------------
 
-        tradingview_url = (
+        tradingview = (
             "https://www.tradingview.com/chart/"
             "?symbol=NSE%3A"
             + symbol
         )
 
-        # ----------------------------------------------------
-        # RESULT
-        # ----------------------------------------------------
-
         return {
-
             "Symbol": symbol,
-
-            "LTP": round(
-                ltp,
-                2
-            ),
-
-            "50 DMA": round(
-                sma50,
-                2
-            ),
-
-            "% From 50 DMA": round(
-                distance_from_50dma,
-                2
-            ),
-
-            "52 Week High": round(
-                high_52w,
-                2
-            ),
-
-            "% Below 52W High": round(
-                below_52w_high,
-                2
-            ),
-
+            "LTP": ltp,
+            "50 DMA": sma50,
+            "% From 50 DMA": distance,
+            "52 Week High": high_52w,
+            "% Below 52W High": below_high,
             "Trading Days": trading_days,
-
-            "TradingView Chart":
-                tradingview_url
+            "TradingView Chart": tradingview,
         }
 
     except Exception:
-
         return None
 
 
 # ============================================================
-# SCAN FUNCTION
+# REFLEX STATE
 # ============================================================
 
-def run_scan():
+class ScannerState(rx.State):
 
-    start_time = time.time()
+    scanning: bool = False
+    completed: bool = False
+
+    progress: int = 0
+    status: str = "Ready to scan."
+
+    total_stocks: int = 0
+    elapsed: str = ""
+
+    days_count: int = 0
+    ltp_count: int = 0
+    dma_count: int = 0
+    final_count: int = 0
+
+    results: list[StockRow] = []
+
+    csv_data: str = ""
+
+    error_message: str = ""
 
     # --------------------------------------------------------
-    # GET NSE UNIVERSE
+    # START SCAN
     # --------------------------------------------------------
 
-    with st.status(
-        "Preparing NSE stock universe...",
-        expanded=True
-    ) as status:
+    @rx.event(background=True)
+    async def run_scan(self):
+
+        async with self:
+            if self.scanning:
+                return
+
+            self.scanning = True
+            self.completed = False
+            self.progress = 0
+            self.status = "Loading NSE stock universe..."
+            self.results = []
+            self.csv_data = ""
+            self.error_message = ""
+
+            self.days_count = 0
+            self.ltp_count = 0
+            self.dma_count = 0
+            self.final_count = 0
+
+        start_time = time.time()
 
         try:
 
-            symbols = get_nse_symbols()
+            # ------------------------------------------------
+            # NSE UNIVERSE
+            # ------------------------------------------------
+
+            symbols = await asyncio.to_thread(
+                get_nse_symbols
+            )
+
+            async with self:
+                self.total_stocks = len(symbols)
+                self.status = (
+                    f"Found {len(symbols):,} NSE EQ stocks."
+                )
+
+            stats = {
+                "365_days": 0,
+                "ltp": 0,
+                "dma50": 0,
+                "52w": 0,
+            }
+
+            results = []
+
+            total_batches = (
+                len(symbols)
+                + BATCH_SIZE
+                - 1
+            ) // BATCH_SIZE
+
+            # ------------------------------------------------
+            # BATCH SCAN
+            # ------------------------------------------------
+
+for batch_number, start in enumerate(
+                range(
+                    0,
+                    len(symbols),
+                    BATCH_SIZE,
+                ),
+                start=1,
+            ):
+
+                batch = symbols[
+                    start:
+                    start + BATCH_SIZE
+                ]
+
+                data = await asyncio.to_thread(
+                    download_batch,
+                    batch,
+                )
+
+                if data is not None and not data.empty:
+
+                    for symbol in batch:
+
+                        result = process_stock(
+                            symbol,
+                            data,
+                            stats,
+                        )
+
+                        if result:
+                            results.append(result)
+
+                percentage = int(
+                    batch_number
+                    / total_batches
+                    * 100
+                )
+
+                processed = min(
+                    start + BATCH_SIZE,
+                    len(symbols),
+                )
+
+                async with self:
+
+                    self.progress = percentage
+
+                    self.status = (
+                        f"Scanning {processed:,} / "
+                        f"{len(symbols):,} stocks"
+                    )
+
+                    self.days_count = stats["365_days"]
+                    self.ltp_count = stats["ltp"]
+                    self.dma_count = stats["dma50"]
+                    self.final_count = stats["52w"]
+
+                await asyncio.sleep(
+                    BATCH_DELAY
+                )
+
+            # ------------------------------------------------
+            # SORT
+            # ------------------------------------------------
+
+            results.sort(
+                key=lambda x: x["% Below 52W High"]
+            )
+
+            rows = []
+
+            for rank, item in enumerate(
+                results,
+                start=1,
+            ):
+
+                rows.append(
+                    StockRow(
+                        rank=rank,
+                        symbol=item["Symbol"],
+                        ltp=f"₹{item['LTP']:,.2f}",
+                        dma50=f"₹{item['50 DMA']:,.2f}",
+                        from_dma50=(
+                            f"{item['% From 50 DMA']:.2f}%"
+                        ),
+                        high_52w=(
+                            f"₹{item['52 Week High']:,.2f}"
+                        ),
+                        below_52w=(
+                            f"{item['% Below 52W High']:.2f}%"
+                        ),
+                        trading_days=item[
+                            "Trading Days"
+                        ],
+                        tradingview=item[
+                            "TradingView Chart"
+                        ],
+                    )
+                )
+
+            # ------------------------------------------------
+            # CSV
+            # ------------------------------------------------
+
+            csv_df = pd.DataFrame(
+                results
+            )
+
+            csv_data = csv_df.to_csv(
+                index=False
+            )
+
+            elapsed = round(
+                time.time() - start_time,
+                1,
+            )
+
+            # ------------------------------------------------
+            # FINAL STATE
+            # ------------------------------------------------
+
+            async with self:
+
+                self.results = rows
+
+                self.csv_data = csv_data
+
+                self.progress = 100
+
+                self.completed = True
+
+                self.scanning = False
+
+                self.final_count = len(rows)
+
+                self.elapsed = (
+                    f"{elapsed} seconds"
+                )
+
+                self.status = (
+                    f"Scan completed — "
+                    f"{len(rows)} matches found."
+                )
 
         except Exception as e:
 
-            status.update(
-                label="❌ Unable to load NSE stock list",
-                state="error"
-            )
+            async with self:
 
-            st.error(
-                f"NSE data error: {e}"
-            )
+                self.scanning = False
 
-            return None
+self.completed = False
 
-        st.write(
-            f"Found {len(symbols):,} NSE EQ stocks."
-        )
+                self.error_message = str(e)
 
-        status.update(
-            label="NSE stock universe loaded",
-            state="complete"
-        )
-
-    # --------------------------------------------------------
-    # STATISTICS
-    # --------------------------------------------------------
-
-    stats = {
-
-        "365_days": 0,
-
-        "ltp": 0,
-
-        "dma50": 0,
-
-        "52w": 0
-    }
-
-    results = []
-
-    total_batches = (
-        len(symbols)
-        + BATCH_SIZE
-        - 1
-    ) // BATCH_SIZE
-
-    # --------------------------------------------------------
-    # PROGRESS
-    # --------------------------------------------------------
-
-    st.subheader(
-        "🔎 Scanning..."
-    )
-
-    progress = st.progress(
-        0,
-        text="Starting scan..."
-    )
-
-    progress_text = st.empty()
-
-    # --------------------------------------------------------
-    # BATCH PROCESSING
-    # --------------------------------------------------------
-
-    for batch_number, start in enumerate(
-        range(
-            0,
-            len(symbols),
-            BATCH_SIZE
-        ),
-        start=1
-    ):
-
-        batch = symbols[
-            start:
-            start + BATCH_SIZE
-        ]
-
-        data = download_batch(
-            batch
-        )
-
-        if data is not None and not data.empty:
-
-            for symbol in batch:
-
-                result = process_stock(
-                    symbol,
-                    data,
-                    stats
+                self.status = (
+                    "Scanner failed."
                 )
-
-                if result is not None:
-
-                    results.append(
-                        result
-                    )
-
-        percentage = (
-            batch_number
-            / total_batches
-        )
-
-        progress.progress(
-            percentage,
-            text=(
-                f"Scanning batch "
-                f"{batch_number}/{total_batches}"
-            )
-        )
-
-        progress_text.write(
-            f"Processed "
-            f"{min(start + BATCH_SIZE, len(symbols)):,}"
-            f" / {len(symbols):,} stocks"
-        )
-
-        time.sleep(
-            BATCH_DELAY
-        )
-
-    progress.progress(
-        1.0,
-        text="Scan completed"
-    )
-
-    # --------------------------------------------------------
-    # DATAFRAME
-    # --------------------------------------------------------
-
-    result_df = pd.DataFrame(
-        results
-    )
-
-    elapsed = round(
-        time.time() - start_time,
-        1
-    )
-
-    if result_df.empty:
-
-        return {
-            "data": None,
-            "stats": stats,
-            "total": len(symbols),
-            "elapsed": elapsed
-        }
-
-    # --------------------------------------------------------
-    # SORT
-    # --------------------------------------------------------
-
-    result_df = result_df.sort_values(
-        by="% Below 52W High",
-        ascending=True
-    ).reset_index(
-        drop=True
-    )
-
-    # Rank
-    result_df.insert(
-        0,
-        "Rank",
-        range(
-            1,
-            len(result_df) + 1
-        )
-    )
-
-    return {
-        "data": result_df,
-        "stats": stats,
-        "total": len(symbols),
-        "elapsed": elapsed
-    }
-
-
-# ============================================================
-# RUN BUTTON
-# ============================================================
-
-st.markdown("### 🚀 Run Scanner")
-
-run_button = st.button(
-    "🔎 RUN SCAN",
-    type="primary",
-    use_container_width=True
-)
-
-
-# ============================================================
-# EXECUTE
-# ============================================================
-
-if run_button:
-
-    scan_result = run_scan()
-
-    if scan_result is None:
-
-        st.stop()
-
-    result_df = scan_result["data"]
-
-    stats = scan_result["stats"]
-
-    total_stocks = scan_result["total"]
-
-    elapsed = scan_result["elapsed"]
-
-    # --------------------------------------------------------
-    # SUMMARY
-    # --------------------------------------------------------
-
-    st.success(
-        f"Scan completed in {elapsed} seconds"
-    )
-
-    st.markdown(
-        "### 📊 Scan Summary"
-    )
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-
-    c1.metric(
-        "NSE Stocks",
-        f"{total_stocks:,}"
-    )
-
-    c2.metric(
-        "365+ Days",
-        f"{stats['365_days']:,}"
-    )
-
-    c3.metric(
-        "LTP > ₹100",
-        f"{stats['ltp']:,}"
-    )
-
-    c4.metric(
-        "Within 50 DMA",
-        f"{stats['dma50']:,}"
-    )
-
-    c5.metric(
-        "Final Matches",
-        f"{stats['52w']:,}"
-    )
-
-    # --------------------------------------------------------
-    # NO RESULTS
-    # --------------------------------------------------------
-
-    if result_df is None:
-
-        st.warning(
-            "No stocks matched all conditions."
-        )
-
-        st.stop()
-
-    # --------------------------------------------------------
-    # RESULTS
-    # --------------------------------------------------------
-
-    st.markdown(
-        f"### 📈 Results — {len(result_df)} stocks"
-    )
 
     # --------------------------------------------------------
     # DOWNLOAD CSV
     # --------------------------------------------------------
 
-    csv_data = result_df.to_csv(
-        index=False
-    ).encode(
-        "utf-8-sig"
-    )
+    @rx.event
+    def download_csv(self):
 
-    st.download_button(
-        label="⬇️ Download CSV",
-        data=csv_data,
-        file_name=(
+        if not self.csv_data:
+            return
+
+        filename = (
             "NSE_Stock_Scanner_"
             + datetime.now().strftime(
                 "%Y%m%d_%H%M"
             )
             + ".csv"
-        ),
-        mime="text/csv",
-        use_container_width=True
-    )
-
-    # --------------------------------------------------------
-    # TABLE
-    # --------------------------------------------------------
-
-    display_df = result_df.copy()
-
-    st.dataframe(
-        display_df,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-
-            "TradingView Chart":
-                st.column_config.LinkColumn(
-                    "📈 Open Chart",
-                    help=(
-                        "Open stock chart "
-                        "in TradingView"
-                    ),
-                    display_text="Open Chart"
-                ),
-
-            "LTP":
-                st.column_config.NumberColumn(
-                    "LTP",
-                    format="₹%.2f"
-                ),
-
-            "50 DMA":
-                st.column_config.NumberColumn(
-                    "50 DMA",
-                    format="₹%.2f"
-                ),
-
-            "% From 50 DMA":
-                st.column_config.NumberColumn(
-                    "% From 50 DMA",
-                    format="%.2f%%"
-                ),
-
-            "52 Week High":
-                st.column_config.NumberColumn(
-                    "52 Week High",
-                    format="₹%.2f"
-                ),
-
-            "% Below 52W High":
-                st.column_config.NumberColumn(
-                    "% Below 52W High",
-                    format="%.2f%%"
-                ),
-
-            "Trading Days":
-                st.column_config.NumberColumn(
-                    "Trading Days",
-                    format="%d"
-                )
-        }
-    )
-
-    # --------------------------------------------------------
-    # LAST SCAN
-    # --------------------------------------------------------
-
-    st.caption(
-        "Last scan: "
-        + datetime.now().strftime(
-            "%d-%m-%Y %H:%M:%S"
         )
+
+        return rx.download(
+            data=self.csv_data,
+            filename=filename,
+        )
+
+
+# ============================================================
+# CONDITIONS
+# ============================================================
+
+def conditions():
+
+    return rx.card(
+
+        rx.vstack(
+
+            rx.heading(
+                "📋 Scan Conditions",
+                size="4",
+            ),
+
+            rx.text(
+                "✅ NSE Equity stocks"
+            ),
+
+            rx.text(
+                f"✅ Minimum {MIN_TRADING_DAYS} trading days"
+            ),
+
+            rx.text(
+                f"✅ LTP > ₹{MIN_LTP:,.0f}"
+            ),
+
+            rx.text(
+                f"✅ LTP within ±{DMA50_DISTANCE}% of 50-DMA"
+            ),
+
+            rx.text(
+                f"✅ Maximum {MAX_BELOW_52W_HIGH}% below 52-week high"
+            ),
+
+            spacing="2",
+            align="start",
+        ),
+
+        width="100%",
     )
 
-else:
 
-    # --------------------------------------------------------
-    # INITIAL SCREEN
-    # --------------------------------------------------------
+# ============================================================
+# SUMMARY
+# ============================================================
 
-    st.info(
-        "Tap **🔎 RUN SCAN** to scan the NSE."
+def summary():
+
+    return rx.grid(
+
+        rx.card(
+            rx.text("NSE Stocks"),
+            rx.heading(
+                ScannerState.total_stocks
+            ),
+        ),
+
+        rx.card(
+            rx.text("365+ Days"),
+            rx.heading(
+                ScannerState.days_count
+            ),
+        ),
+
+        rx.card(
+            rx.text("LTP > ₹100"),
+            rx.heading(
+                ScannerState.ltp_count
+            ),
+        ),
+
+        rx.card(
+            rx.text("Within 50 DMA"),
+            rx.heading(
+                ScannerState.dma_count
+            ),
+        ),
+
+        rx.card(
+            rx.text("Final Matches"),
+            rx.heading(
+                ScannerState.final_count
+            ),
+        ),
+
+        columns=rx.breakpoints(
+            initial="2",
+            sm="3",
+            md="5",
+        ),
+
+        spacing="3",
+
+        width="100%",
     )
 
-    st.markdown(
-        """
-        ### Current filters
 
-        | Condition | Requirement |
-        |---|---|
-        | Market | NSE Equity |
-        | History | ≥ 365 trading days |
-        | LTP | > ₹100 |
-        | 50 DMA | Within ±15% |
-        | 52 Week High | ≤5% below |
-        """
-  )
+# ============================================================
+# RESULT ROW
+# ============================================================
+
+def result_row(row: StockRow):
+
+    return rx.table.row(
+
+        rx.table.cell(
+            row.rank
+        ),
+
+        rx.table.cell(
+            row.symbol
+        ),
+
+        rx.table.cell(
+            row.ltp
+        ),
+
+        rx.table.cell(
+            row.dma50
+        ),
+
+        rx.table.cell(
+            row.from_dma50
+        ),
+
+        rx.table.cell(
+            row.high_52w
+        ),
+
+        rx.table.cell(
+            row.below_52w
+        ),
+
+        rx.table.cell(
+            row.trading_days
+        ),
+
+        rx.table.cell(
+
+            rx.link(
+                "Open Chart",
+                href=row.tradingview,
+                is_external=True,
+            )
+
+        ),
+    )
+
+
+# ============================================================
+# RESULTS TABLE
+# ============================================================
+
+def results_table():
+
+    return rx.box(
+
+        rx.heading(
+            "📈 Scan Results",
+            size="5",
+            margin_bottom="1em",
+        ),
+
+        rx.box(
+
+            rx.table.root(
+
+                rx.table.header(
+
+                    rx.table.row(
+
+                        rx.table.column_header_cell(
+                            "#"
+                        ),
+
+rx.table.column_header_cell(
+                            "Symbol"
+                        ),
+
+                        rx.table.column_header_cell(
+                            "LTP"
+                        ),
+
+                        rx.table.column_header_cell(
+                            "50 DMA"
+                        ),
+
+                        rx.table.column_header_cell(
+                            "% From 50 DMA"
+                        ),
+
+                        rx.table.column_header_cell(
+                            "52W High"
+                        ),
+
+                        rx.table.column_header_cell(
+                            "% Below 52W"
+                        ),
+
+                        rx.table.column_header_cell(
+                            "Trading Days"
+                        ),
+
+                        rx.table.column_header_cell(
+                            "TradingView"
+                        ),
+                    )
+                ),
+
+                rx.table.body(
+
+                    rx.foreach(
+                        ScannerState.results,
+                        result_row,
+                    )
+                ),
+
+                width="100%",
+            ),
+
+            overflow_x="auto",
+            width="100%",
+        ),
+
+        width="100%",
+    )
+
+
+# ============================================================
+# MAIN PAGE
+# ============================================================
+
+def index():
+
+    return rx.container(
+
+        rx.vstack(
+
+            # HEADER
+            rx.vstack(
+
+                rx.heading(
+                    "📈 NSE Stock Scanner",
+                    size="8",
+                ),
+
+                rx.text(
+                    "50-DMA + 52-Week High scanner",
+                    color="gray",
+                ),
+
+                align="start",
+                width="100%",
+            ),
+
+            conditions(),
+
+            # RUN BUTTON
+            rx.button(
+
+                "🔎 RUN SCAN",
+
+                on_click=ScannerState.run_scan,
+
+                loading=ScannerState.scanning,
+
+                disabled=ScannerState.scanning,
+
+                size="4",
+
+                width="100%",
+            ),
+
+            # PROGRESS
+            rx.cond(
+
+                ScannerState.scanning,
+
+                rx.card(
+
+                    rx.vstack(
+
+                        rx.text(
+                            ScannerState.status
+                        ),
+
+                        rx.progress(
+                            value=ScannerState.progress,
+                            max=100,
+                            width="100%",
+                            size="3",
+                        ),
+
+                        rx.text(
+                            f"{ScannerState.progress}%"
+                        ),
+
+                        spacing="3",
+                        width="100%",
+                    ),
+
+                    width="100%",
+                ),
+
+                rx.cond(
+
+                    ScannerState.completed,
+
+                    rx.card(
+
+                        rx.vstack(
+
+                            rx.text(
+                                "✅ "
+                                + ScannerState.status
+                            ),
+
+                            rx.text(
+                                "Scan time: "
+                                + ScannerState.elapsed
+                            ),
+
+                            spacing="2",
+                        ),
+
+                        width="100%",
+                    ),
+
+                    rx.text(
+                        "Tap RUN SCAN to start."
+                    ),
+                ),
+            ),
+
+            # ERROR
+            rx.cond(
+
+                ScannerState.error_message != "",
+
+                rx.callout(
+                    ScannerState.error_message,
+                    icon="triangle_alert",
+                    color_scheme="red",
+                    width="100%",
+                ),
+            ),
+
+# SUMMARY
+            rx.cond(
+
+                ScannerState.completed,
+
+                summary(),
+            ),
+
+            # DOWNLOAD
+            rx.cond(
+
+                ScannerState.final_count > 0,
+
+                rx.button(
+
+                    "⬇️ Download CSV",
+
+                    on_click=ScannerState.download_csv,
+
+                    size="3",
+
+                    width="100%",
+                ),
+            ),
+
+            # RESULTS
+            rx.cond(
+
+                ScannerState.final_count > 0,
+
+                results_table(),
+            ),
+
+            spacing="5",
+
+            width="100%",
+        ),
+
+        max_width="1400px",
+
+        padding="20px",
+
+        width="100%",
+    )
+
+
+# ============================================================
+# APP
+# ============================================================
+
+app = rx.App()
+
+app.add_page(
+    index,
+    title="NSE Stock Scanner",
+)
