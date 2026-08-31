@@ -1,6 +1,8 @@
+
 import asyncio
 import io
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import pandas as pd
@@ -10,22 +12,29 @@ import yfinance as yf
 
 
 # ============================================================
-# NSE STOCK SCANNER - REFLEX VERSION
+# PIPSGO NSE STOCK SCANNER
 # ============================================================
 
 MIN_LTP = 100.0
 DMA50_DISTANCE = 15.0
 MAX_BELOW_52W_HIGH = 5.0
 MIN_TRADING_DAYS = 365
-BATCH_SIZE = 50
-BATCH_DELAY = 0.35
 
+# Faster Yahoo downloads.
+BATCH_SIZE = 100
+DOWNLOAD_WORKERS = 3
+BATCH_RETRIES = 2
+DOWNLOAD_TIMEOUT = 25
 
 NSE_URL = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
 NSE_HOME = "https://www.nseindia.com/"
 
 
-def get_nse_symbols() -> list[str]:
+# ============================================================
+# DATA
+# ============================================================
+
+def get_nse_universe() -> pd.DataFrame:
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -53,71 +62,102 @@ def get_nse_symbols() -> list[str]:
     if "SYMBOL" not in df.columns:
         raise ValueError("NSE SYMBOL column not found.")
 
-    return sorted(
-        df["SYMBOL"]
-        .astype(str)
-        .str.strip()
-        .dropna()
-        .unique()
-        .tolist()
+    company_column = next(
+        (
+            column
+            for column in df.columns
+            if str(column).strip().upper() in {
+                "NAME OF COMPANY",
+                "NAME_OF_COMPANY",
+                "COMPANY NAME",
+                "COMPANY_NAME",
+            }
+        ),
+        None,
     )
 
+    if company_column is None:
+        df["Company"] = df["SYMBOL"].astype(str).str.strip()
+    else:
+        df["Company"] = df[company_column].fillna("").astype(str).str.strip()
 
-def download_batch(batch: list[str]):
+    universe = df[["SYMBOL", "Company"]].copy()
+    universe["SYMBOL"] = universe["SYMBOL"].astype(str).str.strip()
+    universe = universe[
+        universe["SYMBOL"].ne("") & universe["SYMBOL"].notna()
+    ]
+    universe = universe.drop_duplicates("SYMBOL").sort_values("SYMBOL")
+    return universe.reset_index(drop=True)
+
+
+def download_batch(batch: list[str]) -> pd.DataFrame | None:
     tickers = [f"{symbol}.NS" for symbol in batch]
-    try:
-        return yf.download(
-            tickers=tickers,
-            period="2y",
-            interval="1d",
-            group_by="ticker",
-            auto_adjust=False,
-            progress=False,
-            threads=True,
-        )
-    except Exception:
-        return None
+
+    for attempt in range(BATCH_RETRIES + 1):
+        try:
+            data = yf.download(
+                tickers=tickers,
+                period="18mo",
+                interval="1d",
+                group_by="ticker",
+                auto_adjust=False,
+                progress=False,
+                threads=True,
+                timeout=DOWNLOAD_TIMEOUT,
+            )
+            if data is not None and not data.empty:
+                return data
+        except Exception:
+            pass
+
+        if attempt < BATCH_RETRIES:
+            time.sleep(1.0 + attempt)
+
+    return None
 
 
-def process_stock(symbol: str, data, stats: dict):
+def process_stock(
+    symbol: str,
+    company: str,
+    data: pd.DataFrame | None,
+    stats: dict[str, int],
+) -> dict | None:
     ticker = f"{symbol}.NS"
 
     try:
         if data is None or data.empty:
             return None
-
         if not isinstance(data.columns, pd.MultiIndex):
             return None
-
-        level0 = data.columns.get_level_values(0)
-        if ticker not in level0:
+        if ticker not in data.columns.get_level_values(0):
             return None
 
         df = data[ticker].copy()
-        if df.empty:
-            return None
-
         required = ["Close", "High"]
-        df = df.dropna(subset=required)
-        if df.empty:
+
+        if df.empty or any(c not in df.columns for c in required):
             return None
 
+        df = df.dropna(subset=required)
         trading_days = len(df)
+
         if trading_days < MIN_TRADING_DAYS:
             return None
         stats["365_days"] += 1
 
         ltp = float(df["Close"].iloc[-1])
+
         if ltp <= MIN_LTP:
             return None
         stats["ltp"] += 1
 
         sma50 = (
             df["Close"]
-            .rolling(window=50, min_periods=50)
+            .rolling(50, min_periods=50)
             .mean()
             .iloc[-1]
         )
+
         if pd.isna(sma50):
             return None
 
@@ -129,27 +169,37 @@ def process_stock(symbol: str, data, stats: dict):
         stats["dma50"] += 1
 
         last_252 = df.tail(252)
+
         if len(last_252) < 252:
             return None
 
         high_52w = float(last_252["High"].max())
-        below_high = ((high_52w - ltp) / high_52w) * 100.0
-        below_high = max(0.0, below_high)
+
+        if high_52w <= 0:
+            return None
+
+        below_high = max(
+            0.0,
+            ((high_52w - ltp) / high_52w) * 100.0,
+        )
 
         if below_high > MAX_BELOW_52W_HIGH:
             return None
+
         stats["52w"] += 1
 
         return {
             "Rank": 0,
             "Symbol": symbol,
+            "Company": company,
             "LTP": round(ltp, 2),
             "50 DMA": round(sma50, 2),
             "% From 50 DMA": round(distance, 2),
             "52 Week High": round(high_52w, 2),
             "% Below 52W High": round(below_high, 2),
             "Trading Days": trading_days,
-            "TradingView Chart": (
+            "Sector": "—",
+            "Chart": (
                 "https://www.tradingview.com/chart/"
                 f"?symbol=NSE%3A{symbol}"
             ),
@@ -159,9 +209,49 @@ def process_stock(symbol: str, data, stats: dict):
         return None
 
 
+def fetch_sector(symbol: str) -> str:
+    try:
+        info = yf.Ticker(f"{symbol}.NS").get_info()
+        sector = info.get("sector")
+        return str(sector).strip() if sector else "—"
+    except Exception:
+        return "—"
+
+
+def fetch_sectors(symbols: list[str]) -> dict[str, str]:
+    if not symbols:
+        return {}
+
+    sectors: dict[str, str] = {}
+
+    # Only final matches need sector lookups.
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        future_map = {
+            executor.submit(fetch_sector, symbol): symbol
+            for symbol in symbols
+        }
+
+        for future in as_completed(future_map):
+            symbol = future_map[future]
+            try:
+                sectors[symbol] = future.result()
+            except Exception:
+                sectors[symbol] = "—"
+
+    return sectors
+
+
+# ============================================================
+# STATE
+# ============================================================
+
 class ScannerState(rx.State):
     scanning: bool = False
-    progress: float = 0.0
+    stop_requested: bool = False
+
+    # Progress is always 0..100 and must remain an integer for Radix progress bars.
+    progress: int = 0
+
     status: str = "Ready to scan."
     processed: int = 0
     total: int = 0
@@ -170,22 +260,34 @@ class ScannerState(rx.State):
     count_365: int = 0
     count_ltp: int = 0
     count_dma50: int = 0
+    count_52w: int = 0
     count_final: int = 0
+    avg_below_52w: float = 0.0
 
-    rows: list[list] = []
+    rows: list[list[str]] = []
     csv_data: str = ""
 
+    # Trading Days is intentionally kept for scanning/CSV, but hidden
+    # from the on-screen result table.
     columns: list[str] = [
         "Rank",
         "Symbol",
+        "Company",
         "LTP",
         "50 DMA",
         "% From 50 DMA",
         "52 Week High",
         "% Below 52W High",
         "Trading Days",
-        "TradingView Chart",
+        "Sector",
+        "Chart",
     ]
+
+    @rx.event
+    def stop_scan(self):
+        if self.scanning:
+            self.stop_requested = True
+            self.status = "Stopping scan after the current download batch..."
 
     @rx.event(background=True)
     async def run_scan(self):
@@ -194,7 +296,8 @@ class ScannerState(rx.State):
                 return
 
             self.scanning = True
-            self.progress = 0.0
+            self.stop_requested = False
+            self.progress = 0
             self.status = "Loading NSE equity universe..."
             self.processed = 0
             self.total = 0
@@ -202,14 +305,21 @@ class ScannerState(rx.State):
             self.count_365 = 0
             self.count_ltp = 0
             self.count_dma50 = 0
+            self.count_52w = 0
             self.count_final = 0
+            self.avg_below_52w = 0.0
             self.rows = []
             self.csv_data = ""
 
         start_time = time.time()
 
         try:
-            symbols = await asyncio.to_thread(get_nse_symbols)
+            universe = await asyncio.to_thread(get_nse_universe)
+
+            symbols = universe["SYMBOL"].tolist()
+            company_map = dict(
+                zip(universe["SYMBOL"], universe["Company"])
+            )
 
             async with self:
                 self.total = len(symbols)
@@ -222,229 +332,845 @@ class ScannerState(rx.State):
                 "52w": 0,
             }
 
-            results = []
-            total_batches = (len(symbols) + BATCH_SIZE - 1) // BATCH_SIZE
+            results: list[dict] = []
 
-            for batch_number, start in enumerate(
-                range(0, len(symbols), BATCH_SIZE), start=1
-            ):
-                batch = symbols[start:start + BATCH_SIZE]
-                data = await asyncio.to_thread(download_batch, batch)
+            batches = [
+                symbols[i:i + BATCH_SIZE]
+                for i in range(0, len(symbols), BATCH_SIZE)
+            ]
 
-                if data is not None and not data.empty:
-                    for symbol in batch:
-                        result = process_stock(symbol, data, stats)
-                        if result is not None:
-                            results.append(result)
+            total_batches = len(batches)
+            completed_batches = 0
 
-                processed = min(start + BATCH_SIZE, len(symbols))
-                progress = processed / len(symbols) if symbols else 1.0
-
+            # Process a small number of batches concurrently. Unlike creating
+            # every task at once, this lets Stop Scan take effect between waves.
+            for wave_start in range(0, total_batches, DOWNLOAD_WORKERS):
                 async with self:
-                    self.processed = processed
-                    self.progress = progress
-                    self.count_365 = stats["365_days"]
-                    self.count_ltp = stats["ltp"]
-                    self.count_dma50 = stats["dma50"]
-                    self.count_final = stats["52w"]
-                    self.status = (
-                        f"Scanning batch {batch_number}/{total_batches} "
-                        f"— {processed:,}/{len(symbols):,}"
+                    if self.stop_requested:
+                        break
+
+                wave = batches[
+                    wave_start:wave_start + DOWNLOAD_WORKERS
+                ]
+
+                tasks = [
+                    asyncio.create_task(
+                        asyncio.to_thread(download_batch, batch)
+                    )
+                    for batch in wave
+                ]
+
+                wave_data = await asyncio.gather(
+                    *tasks,
+                    return_exceptions=True,
+                )
+
+                for batch, data in zip(wave, wave_data):
+                    if isinstance(data, Exception):
+                        data = None
+
+                    if data is not None and not data.empty:
+                        for symbol in batch:
+                            result = process_stock(
+                                symbol,
+                                company_map.get(symbol, symbol),
+                                data,
+                                stats,
+                            )
+
+                            if result is not None:
+                                results.append(result)
+
+                    completed_batches += 1
+
+                    processed = min(
+                        completed_batches * BATCH_SIZE,
+                        len(symbols),
                     )
 
-                await asyncio.sleep(BATCH_DELAY)
+                    progress_pct = (
+                        processed / len(symbols) * 100.0
+                        if symbols
+                        else 100.0
+                    )
+                    progress_value = int(round(progress_pct))
 
-            results.sort(key=lambda x: x["% Below 52W High"])
+                    async with self:
+                        self.processed = processed
+                        self.progress = progress_value
+                        self.count_365 = stats["365_days"]
+                        self.count_ltp = stats["ltp"]
+                        self.count_dma50 = stats["dma50"]
+                        self.count_52w = stats["52w"]
+
+                        if not self.stop_requested:
+                            self.status = (
+                                f"Scanning batch "
+                                f"{completed_batches}/{total_batches} "
+                                f"— {processed:,}/{len(symbols):,}"
+                            )
+
+                async with self:
+                    if self.stop_requested:
+                        break
+
+            async with self:
+                stopped = self.stop_requested
+
+            # Sort and rank whatever has been collected.
+            results.sort(
+                key=lambda x: x["% Below 52W High"]
+            )
+
             for index, result in enumerate(results, start=1):
                 result["Rank"] = index
 
-            df = pd.DataFrame(results, columns=self.columns)
-            csv_text = df.to_csv(index=False) if not df.empty else ""
+            # Only fetch sectors when the user lets the scan finish.
+            if results and not stopped:
+                async with self:
+                    self.status = (
+                        f"Scan complete. Loading sectors for "
+                        f"{len(results):,} matches..."
+                    )
 
+                sector_map = await asyncio.to_thread(
+                    fetch_sectors,
+                    [result["Symbol"] for result in results],
+                )
+
+                for result in results:
+                    result["Sector"] = sector_map.get(
+                        result["Symbol"],
+                        "—",
+                    )
+
+            avg_below = (
+                sum(
+                    float(result["% Below 52W High"])
+                    for result in results
+                ) / len(results)
+                if results
+                else 0.0
+            )
+
+            df = pd.DataFrame(
+                results,
+                columns=self.columns,
+            )
+
+            csv_text = (
+                df.to_csv(index=False)
+                if not df.empty
+                else ""
+            )
+
+            # Trading Days remains in CSV/data but is hidden from the UI.
             rows = [
-                [row.get(column, "") for column in self.columns]
-                for row in results
+                [
+                    str(result["Rank"]),
+                    result["Symbol"],
+                    result["Company"],
+                    f"{result['LTP']:,.2f}",
+                    f"{result['50 DMA']:,.2f}",
+                    f"{result['% From 50 DMA']:.2f}",
+                    f"{result['52 Week High']:,.2f}",
+                    f"{result['% Below 52W High']:.2f}",
+                    str(result["Trading Days"]),
+                    result["Sector"],
+                    result["Chart"],
+                ]
+                for result in results
             ]
 
-            elapsed = round(time.time() - start_time, 1)
+            elapsed = round(
+                time.time() - start_time,
+                1,
+            )
 
             async with self:
                 self.rows = rows
                 self.csv_data = csv_text
                 self.elapsed = elapsed
-                self.progress = 1.0
                 self.count_final = len(results)
-                self.status = (
-                    f"Scan completed: {len(results)} matches "
-                    f"in {elapsed:.1f} seconds."
-                )
+                self.avg_below_52w = round(avg_below, 2)
+
+                if stopped:
+                    self.status = (
+                        f"Scan stopped: {len(results)} matches "
+                        f"collected in {elapsed:.1f} seconds."
+                    )
+                else:
+                    self.progress = 100
+                    self.status = (
+                        f"Scan completed: {len(results)} matches "
+                        f"in {elapsed:.1f} seconds."
+                    )
 
         except Exception as exc:
             async with self:
                 self.status = f"Scan failed: {exc}"
-                self.elapsed = round(time.time() - start_time, 1)
+                self.elapsed = round(
+                    time.time() - start_time,
+                    1,
+                )
 
         finally:
             async with self:
                 self.scanning = False
+                self.stop_requested = False
 
     @rx.event
     def download_csv(self):
         if not self.csv_data:
-            return rx.window_alert("Run the scanner first.")
+            return rx.window_alert(
+                "Run the scanner first."
+            )
+
         filename = (
-            "NSE_Stock_Scanner_"
+            "PIPSGO_NSE_Scanner_"
             + datetime.now().strftime("%Y%m%d_%H%M")
             + ".csv"
         )
+
         return rx.download(
             data=self.csv_data,
             filename=filename,
         )
 
 
-def condition_box(text: str) -> rx.Component:
+# ============================================================
+# UI
+# ============================================================
+
+BG = "#F4F7F5"
+SURFACE = "#FFFFFF"
+TEXT = "#17202A"
+MUTED = "#6B7280"
+BORDER = "#DFE6E2"
+ACCENT = "#18A873"
+ACCENT_DARK = "#11875D"
+DANGER = "#D64545"
+
+
+def panel(*children, **props) -> rx.Component:
     return rx.box(
-        rx.text(text, size="3"),
-        padding="12px",
+        *children,
+        background=SURFACE,
+        border=f"1px solid {BORDER}",
+        border_radius="14px",
+        padding="18px",
+        **props,
+    )
+
+
+def stat_card(label: str, value) -> rx.Component:
+    return rx.box(
+        rx.text(
+            label,
+            size="1",
+            weight="bold",
+            color=MUTED,
+        ),
+        rx.heading(
+            value,
+            size="5",
+            color=TEXT,
+            margin_top="4px",
+        ),
+        padding="13px",
+        border=f"1px solid {BORDER}",
         border_radius="10px",
-        background="var(--gray-a3)",
+        background=SURFACE,
         width="100%",
     )
 
 
-def metric_card(label: str, value) -> rx.Component:
-    return rx.card(
+def sidebar() -> rx.Component:
+    return rx.box(
         rx.vstack(
-            rx.text(label, size="2", color="gray"),
-            rx.heading(value, size="5"),
-            spacing="1",
+            rx.text(
+                "PIPSGO",
+                size="6",
+                weight="bold",
+                color=TEXT,
+            ),
+
+            rx.text(
+                "SCANNERS LIBRARY",
+                size="1",
+                weight="bold",
+                color=MUTED,
+            ),
+
+            rx.box(
+                rx.vstack(
+                    rx.hstack(
+                        rx.text(
+                            "NSE Stock Scanner",
+                            size="3",
+                            weight="bold",
+                            color=TEXT,
+                        ),
+                        rx.spacer(),
+                        rx.cond(
+                            ScannerState.scanning,
+                            rx.badge(
+                                "LIVE",
+                                color_scheme="green",
+                                variant="soft",
+                            ),
+                            rx.badge(
+                                "IDLE",
+                                color_scheme="gray",
+                                variant="soft",
+                            ),
+                        ),
+                        width="100%",
+                    ),
+
+                    rx.text(
+                        "50-DMA + 52-Week High scanner",
+                        size="2",
+                        color=MUTED,
+                    ),
+
+                    align="start",
+                    width="100%",
+                    spacing="2",
+                ),
+
+                border=f"1px solid {BORDER}",
+                border_radius="10px",
+                padding="14px",
+                width="100%",
+                background=SURFACE,
+            ),
+
+            rx.spacer(),
+
+            rx.text(
+                "PIPSGO",
+                size="1",
+                color=MUTED,
+            ),
+
+            width="100%",
+            height="100%",
             align="start",
         ),
+
+        width="230px",
+        min_width="230px",
+        height="100vh",
+        padding="24px 14px",
+        border_right=f"1px solid {BORDER}",
+        background=SURFACE,
+    )
+
+
+def filter_badge(
+    text: str,
+    color_scheme: str,
+) -> rx.Component:
+    return rx.badge(
+        text,
+        color_scheme=color_scheme,
+        variant="soft",
+        size="2",
+        padding="6px 10px",
+    )
+
+
+def scanner_header() -> rx.Component:
+    return panel(
+        rx.hstack(
+            rx.vstack(
+                rx.heading(
+                    "52W HIGH + 50MA",
+                    size="6",
+                    color=TEXT,
+                ),
+
+                rx.text(
+                    "Scans NSE equities using 50-DMA + 52-Week High conditions.",
+                    size="2",
+                    color=MUTED,
+                ),
+
+                align="start",
+                spacing="1",
+            ),
+
+            rx.spacer(),
+
+            # RUN / STOP button
+            rx.cond(
+                ScannerState.scanning,
+
+                rx.button(
+                    "■  STOP SCAN",
+                    on_click=ScannerState.stop_scan,
+                    background=DANGER,
+                    color="white",
+                    size="3",
+                    _hover={
+                        "background": "#B93636"
+                    },
+                ),
+
+                rx.button(
+                    "▶  RUN SCAN",
+                    on_click=ScannerState.run_scan,
+                    background=ACCENT,
+                    color="white",
+                    size="3",
+                    _hover={
+                        "background": ACCENT_DARK
+                    },
+                ),
+            ),
+
+            width="100%",
+            align="center",
+        ),
+
+        rx.divider(
+            margin_y="14px"
+        ),
+
+        rx.vstack(
+            rx.text(
+                "ACTIVE FILTERS",
+                size="1",
+                weight="bold",
+                color=MUTED,
+            ),
+
+            rx.hstack(
+                filter_badge(
+                    f"LTP > ₹{MIN_LTP:,.0f}",
+                    "blue",
+                ),
+
+                filter_badge(
+                    f"50 DMA ±{DMA50_DISTANCE}%",
+                    "purple",
+                ),
+
+                filter_badge(
+                    f"52W High ≤{MAX_BELOW_52W_HIGH}%",
+                    "green",
+                ),
+
+                filter_badge(
+                    f"≥{MIN_TRADING_DAYS} Trading Days",
+                    "orange",
+                ),
+
+                wrap="wrap",
+                width="100%",
+            ),
+
+            align="start",
+            spacing="2",
+        ),
+
         width="100%",
     )
 
 
-def results_section() -> rx.Component:
-    return rx.vstack(
+def table_row(row: list[str]) -> rx.Component:
+    return rx.table.row(
+        rx.table.cell(
+            rx.text(
+                row[0],
+                size="1",
+                color=MUTED,
+            )
+        ),
+
+        rx.table.cell(
+            rx.text(
+                row[1],
+                weight="bold",
+                size="2",
+                color=TEXT,
+            )
+        ),
+
+        rx.table.cell(
+            rx.text(
+                row[2],
+                size="1",
+                color=TEXT,
+                max_width="125px",
+                overflow="hidden",
+                text_overflow="ellipsis",
+                white_space="nowrap",
+            )
+        ),
+
+        rx.table.cell(
+            rx.text(
+                f"₹{row[3]}",
+                size="1",
+                color=TEXT,
+            )
+        ),
+
+        rx.table.cell(
+            rx.text(
+                f"₹{row[4]}",
+                size="1",
+                color=TEXT,
+            )
+        ),
+
+        rx.table.cell(
+            rx.text(
+                f"{row[5]}%",
+                size="1",
+                color=TEXT,
+            )
+        ),
+
+        rx.table.cell(
+            rx.text(
+                f"₹{row[6]}",
+                size="1",
+                color=TEXT,
+            )
+        ),
+
+        rx.table.cell(
+            rx.badge(
+                f"{row[7]}%",
+                color_scheme="green",
+                variant="soft",
+                size="1",
+            )
+        ),
+
+        # Trading Days intentionally hidden from the result table.
+
+        rx.table.cell(
+            rx.text(
+                row[9],
+                size="1",
+                color=MUTED,
+                max_width="95px",
+                overflow="hidden",
+                text_overflow="ellipsis",
+                white_space="nowrap",
+            )
+        ),
+
+        rx.table.cell(
+            rx.link(
+                "Open ↗",
+                href=row[10],
+                is_external=True,
+                color_scheme="green",
+                weight="bold",
+                underline="none",
+                size="1",
+            )
+        ),
+
+        white_space="nowrap",
+    )
+
+
+def results_table() -> rx.Component:
+    return rx.box(
+        rx.table.root(
+            rx.table.header(
+                rx.table.row(
+                    rx.table.column_header_cell("#"),
+                    rx.table.column_header_cell("SYMBOL"),
+                    rx.table.column_header_cell("COMPANY"),
+                    rx.table.column_header_cell("LTP"),
+                    rx.table.column_header_cell("50 DMA"),
+                    rx.table.column_header_cell("% 50 DMA"),
+                    rx.table.column_header_cell("52W HIGH"),
+                    rx.table.column_header_cell("% BELOW"),
+                    rx.table.column_header_cell("SECTOR"),
+                    rx.table.column_header_cell("CHART"),
+                )
+            ),
+
+            rx.table.body(
+                rx.foreach(
+                    ScannerState.rows,
+                    table_row,
+                )
+            ),
+
+            width="100%",
+            size="1",
+            variant="surface",
+        ),
+
+        width="100%",
+        overflow_x="auto",
+    )
+
+
+def results_panel() -> rx.Component:
+    return panel(
+        # Table title + Export CSV on the top-right
+        rx.hstack(
+            rx.heading(
+                "SCAN RESULTS",
+                size="3",
+                color=TEXT,
+            ),
+
+            rx.spacer(),
+
+            rx.cond(
+                ScannerState.csv_data != "",
+                rx.button(
+                    "⇩  EXPORT CSV",
+                    on_click=ScannerState.download_csv,
+                    background=ACCENT,
+                    color="white",
+                    size="2",
+                    _hover={
+                        "background": ACCENT_DARK
+                    },
+                ),
+                rx.fragment(),
+            ),
+
+            width="100%",
+            align="center",
+        ),
+
+        rx.hstack(
+            rx.text(
+                ScannerState.status,
+                size="1",
+                color=MUTED,
+            ),
+            rx.spacer(),
+            rx.cond(
+                ScannerState.rows.length() > 0,
+                rx.text(
+                    ScannerState.count_final.to_string()
+                    + " matches",
+                    size="1",
+                    weight="bold",
+                    color=ACCENT_DARK,
+                ),
+                rx.fragment(),
+            ),
+            width="100%",
+            margin_top="4px",
+        ),
+
         rx.cond(
             ScannerState.scanning,
-            rx.progress(
-                value=ScannerState.progress * 100,
+
+            rx.vstack(
+                rx.progress(
+                    value=ScannerState.progress,
+                    width="100%",
+                    color_scheme="green",
+                ),
+
+                rx.hstack(
+                    rx.text(
+                        ScannerState.processed.to_string()
+                        + " / "
+                        + ScannerState.total.to_string()
+                        + " stocks",
+                        size="1",
+                        color=MUTED,
+                    ),
+
+                    rx.spacer(),
+
+                    rx.text(
+                        ScannerState.progress.to_string()
+                        + "%",
+                        size="1",
+                        weight="bold",
+                        color=ACCENT_DARK,
+                    ),
+
+                    width="100%",
+                ),
+
                 width="100%",
+                spacing="2",
+                margin_top="8px",
             ),
+
             rx.fragment(),
         ),
-        rx.text(ScannerState.status, size="2", color="gray"),
-        rx.grid(
-            metric_card("NSE Stocks", ScannerState.total),
-            metric_card("365+ Days", ScannerState.count_365),
-            metric_card("LTP > ₹100", ScannerState.count_ltp),
-            metric_card("Within 50 DMA", ScannerState.count_dma50),
-            metric_card("Final Matches", ScannerState.count_final),
-            columns=rx.breakpoints(initial="2", sm="3", md="5"),
-            spacing="3",
-            width="100%",
-        ),
-        rx.cond(
-            ScannerState.csv_data != "",
-            rx.button(
-                "⬇️ Download CSV",
-                on_click=ScannerState.download_csv,
-                width="100%",
-            ),
-            rx.fragment(),
-        ),
+
         rx.cond(
             ScannerState.rows.length() > 0,
-            rx.data_table(
-                data=ScannerState.rows,
-                columns=ScannerState.columns,
-                search=True,
-                sort=True,
-                pagination={"pageSize": 20},
-                resizable=True,
-                width="100%",
-            ),
-            rx.callout(
-                "Run the scanner to see matching stocks.",
-                icon="info",
+
+            results_table(),
+
+            rx.box(
+                rx.text(
+                    "Run the scanner to see matching stocks.",
+                    size="2",
+                    color=MUTED,
+                ),
+                padding="40px",
+                text_align="center",
                 width="100%",
             ),
         ),
+
         width="100%",
-        spacing="4",
+    )
+
+
+def right_panel() -> rx.Component:
+    return rx.vstack(
+        panel(
+            rx.vstack(
+                rx.text(
+                    "SCAN COMPLETION",
+                    size="2",
+                    weight="bold",
+                    color=TEXT,
+                ),
+
+                rx.progress(
+                    value=ScannerState.progress,
+                    width="100%",
+                    color_scheme="green",
+                ),
+
+                rx.heading(
+                    ScannerState.progress.to_string()
+                    + "%",
+                    size="7",
+                    color=TEXT,
+                ),
+
+                rx.text(
+                    ScannerState.processed.to_string()
+                    + " / "
+                    + ScannerState.total.to_string()
+                    + " stocks scanned",
+                    size="1",
+                    color=MUTED,
+                ),
+
+                width="100%",
+                align="center",
+                spacing="3",
+            ),
+
+            width="100%",
+        ),
+
+        rx.text(
+            "SESSION STATISTICS",
+            size="1",
+            weight="bold",
+            color=MUTED,
+        ),
+
+        stat_card(
+            "STOCKS SCANNED",
+            ScannerState.processed,
+        ),
+
+        stat_card(
+            "MATCHES FOUND",
+            ScannerState.count_final,
+        ),
+
+        stat_card(
+            "LTP > ₹100",
+            ScannerState.count_ltp,
+        ),
+
+        stat_card(
+            "WITHIN 50 DMA",
+            ScannerState.count_dma50,
+        ),
+
+        stat_card(
+            "≤ 5% BELOW 52W HIGH",
+            ScannerState.count_52w,
+        ),
+
+        stat_card(
+            "AVG. BELOW 52W HIGH",
+            ScannerState.avg_below_52w.to_string()
+            + "%",
+        ),
+
+        stat_card(
+            "SCAN DURATION",
+            ScannerState.elapsed.to_string()
+            + " sec",
+        ),
+
+        width="100%",
+        spacing="3",
     )
 
 
 def index() -> rx.Component:
-    return rx.container(
-        rx.vstack(
-            rx.heading("📈 NSE Stock Scanner", size="8"),
-            rx.text(
-                "50-DMA + 52-Week High scanner",
-                color="gray",
-                size="4",
-            ),
+    return rx.box(
+        rx.hstack(
+            sidebar(),
 
-            rx.accordion.root(
-                rx.accordion.item(
-                    header="📋 Scan Conditions",
-                    content=rx.vstack(
-                        condition_box("✅ NSE Equity stocks"),
-                        condition_box(
-                            f"✅ Minimum {MIN_TRADING_DAYS} trading days"
-                        ),
-                        condition_box(f"✅ LTP > ₹{MIN_LTP:,.0f}"),
-                        condition_box(
-                            f"✅ LTP within ±{DMA50_DISTANCE}% of 50-DMA"
-                        ),
-                        condition_box(
-                            f"✅ Maximum {MAX_BELOW_52W_HIGH}% below 52-week high"
-                        ),
-                        spacing="2",
-                        width="100%",
-                    ),
+            rx.box(
+                rx.vstack(
+                    scanner_header(),
+                    results_panel(),
+                    width="100%",
+                    spacing="4",
                 ),
-                collapsible=True,
-                width="100%",
+
+                flex="1",
+                padding="24px",
+                overflow="auto",
+                height="100vh",
+                min_width="0",
             ),
 
-            rx.button(
-                rx.cond(
-                    ScannerState.scanning,
-                    "🔄 SCANNING...",
-                    "🔎 RUN SCAN",
-                ),
-                on_click=ScannerState.run_scan,
-                disabled=ScannerState.scanning,
-                size="4",
-                width="100%",
-            ),
-
-            results_section(),
-
-            rx.text(
-                "Data source: NSE equity list + Yahoo Finance historical data. "
-                "TradingView links open NSE charts.",
-                size="1",
-                color="gray",
+            rx.box(
+                right_panel(),
+                width="270px",
+                min_width="270px",
+                padding="24px 18px",
+                border_left=f"1px solid {BORDER}",
+                height="100vh",
+                overflow="auto",
+                background=BG,
             ),
 
             width="100%",
-            spacing="5",
+            height="100vh",
+            spacing="0",
             align="stretch",
         ),
-        size="4",
-        padding_y="32px",
+
+        background=BG,
+        color=TEXT,
+        width="100%",
+        min_height="100vh",
     )
 
 
 app = rx.App(
     theme=rx.theme(
-        appearance="dark",
-        radius="large",
-        accent_color="blue",
+        appearance="light",
+        radius="medium",
+        accent_color="green",
     )
 )
+
 app.add_page(index)
